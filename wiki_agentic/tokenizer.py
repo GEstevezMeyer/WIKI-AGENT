@@ -10,89 +10,119 @@ from tqdm import tqdm
 
 
 class Tokenizer:
-    def __init__(self,padding_lenght:int = 512,not_found_token = -1):
-        self._vocabulary:dict = {}
-        self._found_word:set = set()
-        self._last_token:int = 0
-        self.padding_lenght = padding_lenght
-        self.not_found_token = not_found_token
+    def __init__(self,padding_lenght:int = 512,not_found_token:int = 0):
+        self._merges:dict[tuple[int,int],int] = {}
+        self._vocabulary:dict[int,bytes] = {}
+        self.padding_lenght:int = padding_lenght
+        self.not_found_token:int = not_found_token
+        self._last_token = 256
+
+        for i in range(256):
+            self._vocabulary[i] = bytes([i])
+
+    @staticmethod
+    def _get_stats(tokens: list[int]) -> dict[tuple[int, int], int]:
+        counts: dict[tuple[int, int], int] = {}
+        for pair in zip(tokens, tokens[1:]):
+            counts[pair] = counts.get(pair, 0) + 1
+        return counts
+
+    @staticmethod
+    def _merge_pair(ids: list[int], pair: tuple[int, int], new_id: int) -> list[int]:
+    
+        new_ids: list[int] = []
+        i: int = 0
+        while i < len(ids):
+            
+            if i < len(ids) - 1 and ids[i] == pair[0] and ids[i + 1] == pair[1]:
+                new_ids.append(new_id)
+                i += 2  
+            else:
+                new_ids.append(ids[i])
+                i += 1
+        return new_ids
+    
+    def _encode_raw_dataset(dataset:list[str]) -> list[int]:
+        tokens:list[int] = []
+        for text in dataset:
+            tokens.extend(text.encode("utf-8"))
+
+        return tokens
+
+    def fit(self,dataset:list[str],n_merges:int = 1000) -> None:
+        tokens:list[int] = self._encode_raw_dataset(dataset)
+
+        for _ in tqdm(range(n_merges),desc= "fitting tokenizer"):
+            counts:dict[tuple[int, int], int] = self._get_stats(tokens)
+            mcp:int = max(counts,keys = counts.get)
+            self._last_token+=1
+            self.merge[mcp] = self._last_token
+            self._vocabulary = (self._vocabulary[mcp[0]],self.self._vocabulary[mcp[1]])
+
+            tokens:list[int] = self._merge_pair(tokens,mcp,self._last_token)
+
+
+    def encode(self, text: str) -> list[int]:
+        tokens: list[int] = list(text.encode("utf-8"))
+
+        for pair, new_id in self._merges.items():
+            tokens = self._merge_pair(tokens, pair, new_id)
+
+        return tokens
+    
+    def decode(self, ids: list[int]) -> str:
         
-
-    @property
-    def vocabulary(self):
-        return self._vocabulary
+        byte_sequence = b"".join(
+            self._vocabulary[token_id]
+            for token_id in ids
+            if token_id in self._vocabulary
+        )
+        return byte_sequence.decode("utf-8", errors="replace")
     
-    @vocabulary.setter
-    def vocabulary(self,new_vocab:dict[int]): 
-        self._vocabulary = dict(sorted(new_vocab.items()))
-        self._found_word = set(new_vocab.keys())
-        self._last_token = self.vocabulary[list(self.vocabulary.keys())[-1]]
+    def _padding(self, token_list: list[int]) -> list[int]:
+        if self.padding_length < len(token_list):
+            return token_list[:self.padding_length]       
+        padding = [0] * (self.padding_length - len(token_list))
 
-    def _cleaning_text(self,text:str) -> list[str]: 
-        text:str = re.sub(r'[^a-záéíóúüñA-ZÁÉÍÓÚÜÑ\s]', '', text).lower()
-        word_list:list[str] = text.split(" ")
-        return  word_list
+        return token_list + padding                       
 
-    def _fit_text(self,text:str) -> None:
-        word_list:list[str] = self._cleaning_text(text)
-        for word in word_list:
-            if (word not in self._found_word) and (len(word) >= 1):
-                self._last_token+= 1
-                self._vocabulary[word] = self._last_token
-                self._found_word.add(word)
-
-    def fit(self,dataset:list[str]) -> None:
-        for i in tqdm(range(len(dataset)),f"Fiting text"):
-            self._fit_text(dataset[i])
-
-    def fit_hugging_face(self,dataset:IterableDataset,shard_name = "0") -> None:
-        position = int(shard_name)
-        for row in tqdm(dataset,position=position,desc= f"Fitting shard_{shard_name}:"):
-            self._fit_text(row["text"])
-
-    def _padding(self,token_list:list[int]) -> list[int]:
-        res:list[int] = []
-        n:int = len(token_list)
-
-        if self.padding_lenght < n:
-            res.extend(token_list[:self.padding_lenght])
-        else:
-            res.extend(token_list)
-            res.extend([0 for _ in range(self.padding_lenght-n)])
-
-        return res 
-
-    def _transform_text(self,text:str) -> list[int]:
-        res:list[int] = []
-        word_list:list[str] = self._cleaning_text(text)
-        for word in word_list:
-            if word in self._found_word:
-                res.append(self.vocabulary[word])
-            elif len(word) >= 1:
-                res.append(self.not_found_token)
-
-        return self._padding(res)
+    def transform(self, dataset: list[str]) -> list[list[int]]:
+        return [self._padding(self.encode(text)) for text in dataset]
     
-    def transform(self,dataset:list[str]) -> list[list[int]]:
-        res:list[list[int]] = []
-        for i in range(len(dataset)):
-            res.append(self._transform_text(dataset[i]))
-        return res 
-    
-    def save_tokenizer(self,path:str) -> None:
+    def save_tokenizer(self, path: str) -> None:
+        data = {
+            "merges": {f"{a},{b}": new_id for (a, b), new_id in self._merges.items()},
+            "padding_length": self.padding_length,
+            "not_found_token": self.not_found_token,
+        }
         with open(path, "w") as f:
-            json.dump(self.vocabulary,f)
+            json.dump(data, f, indent=2)
+    
+
+    def load_tokenizer(self, path: str) -> None:
         
+        with open(path, "r") as f:
+            data = json.load(f)
+
+        self.padding_length = data["padding_length"]
+        self.not_found_token = data["not_found_token"]
+
         
-    def upload_tokenizer(self,path:str) -> None:
-        with open(path,"r") as f:
-            self.vocabulary = json.load(f) 
+        self._merges = {}
+        self._vocabulary = {i: bytes([i]) for i in range(256)}
+        self._last_token = 255
+
+        for key, new_id in data["merges"].items():
+            a, b = map(int, key.split(","))
+            pair = (a, b)
+            self._merges[pair] = new_id
+            self._vocabulary[new_id] = (
+                self._vocabulary[a] + self._vocabulary[b]
+            )
+            self._last_token = max(self._last_token, new_id)
+    
 
 
-def tokenizer_fit_process(q: Queue, dataset: IterableDataset, shard_name: str) -> None:
-    tokenizer = Tokenizer()
-    tokenizer.fit_hugging_face(dataset, shard_name)
-    q.put(tokenizer.vocabulary)  
 
 def merge_vocabularies(base: Tokenizer, vocabularies: list[dict]) -> None:
     for vocab in tqdm(vocabularies, desc="Merging vocab"):
@@ -102,37 +132,3 @@ def merge_vocabularies(base: Tokenizer, vocabularies: list[dict]) -> None:
                 base._vocabulary[word] = base._last_token
                 base._found_word.add(word)
 
-def create_tokenizer(
-    hugging_face_dataset: str,version: str,split: str,
-    padding_lenght: int,not_found_token: int = -1) -> Tokenizer:
-
-    q: Queue = Queue()
-    cpu_count: int = int(os.environ.get("cpu_count", "1"))
-    tokenizer: Tokenizer = Tokenizer(padding_lenght, not_found_token)
-    divided_datasets: list[IterableDataset] = divide_dataset_shards(hugging_face_dataset, version, 
-                                                                    split, cpu_count)
-
-    fn: function = partial(tokenizer_fit_process, q=q)
-
-    list_process: list[Process] = [Process(target=fn,kwargs={"dataset": divided_datasets[i], "shard_name": str(i)})
-                                   for i in range(cpu_count)]
-
-    for process in tqdm(list_process, desc="Starting processes"):
-        process.start()
-
-    vocabularies = [q.get() for _ in range(cpu_count)]
-
-    for process in list_process:
-        process.join()  
-
-    merge_vocabularies(tokenizer, vocabularies)
-
-    return tokenizer
-
-if __name__ == "__main__": 
-    test = Tokenizer()
-
-    test.upload_tokenizer("test.json")
-
-    print(test.transform(["Hello my name is Gabriel"]))
-    print(len(list(test.vocabulary.keys())))
