@@ -1,19 +1,22 @@
-import re
 import json 
 import os 
-
-from datasets import IterableDataset
-from wiki_agentic.utils import divide_dataset_shards
-from multiprocessing import Process,Queue
-from functools import partial
+from multiprocessing import Pool
+from datasets import IterableDataset,IterableDatasetDict,load_dataset
 from tqdm import tqdm 
+
+def _encode_huggingface_dataset_standalone(dataset: IterableDataset) -> list[int]:
+    tokens: list[int] = []
+    for row in tqdm(dataset, desc="encoding"):
+        tokens.extend(row["text"].encode("utf-8"))
+    return tokens
+
 
 
 class Tokenizer:
-    def __init__(self,padding_lenght:int = 512,not_found_token:int = 0):
+    def __init__(self,padding_length:int = 512,not_found_token:int = 0):
         self._merges:dict[tuple[int,int],int] = {}
         self._vocabulary:dict[int,bytes] = {}
-        self.padding_lenght:int = padding_lenght
+        self.padding_length: int = padding_length
         self.not_found_token:int = not_found_token
         self._last_token = 256
 
@@ -42,22 +45,53 @@ class Tokenizer:
                 i += 1
         return new_ids
     
+    
+    def _encode_hugginface_dataset_multiprocessing(self,dataset:IterableDataset):
+        cpu_count:int = int(os.environ.get("cpu_count",1))
+        n_process = cpu_count
+        if cpu_count > dataset.num_shards:
+            n_process = dataset.num_shards
+
+        divided_dataset:list[IterableDataset] = [dataset.shard(num_shards=cpu_count,index=i) for i in range(n_process)]
+        res_tokens:list[int] = []
+
+        with Pool(n_process) as p:
+            divided_tokens:list[list[int]] = p.map(_encode_huggingface_dataset_standalone,divided_dataset)
+
+        for tokens in tqdm(divided_tokens,desc="merging tokens"):
+            res_tokens.extend(tokens)
+
+        return res_tokens
+
+    @staticmethod
+    def _encode_huggingface_dataset(dataset:IterableDataset) -> list[int]:
+        tokens:list[int] = [] 
+        for row in tqdm(dataset,desc="encoding hugging face dataset"):
+            tokens.extend(row["text"].encode("utf-8"))
+        return tokens
+
+    @staticmethod
     def _encode_raw_dataset(dataset:list[str]) -> list[int]:
         tokens:list[int] = []
-        for text in dataset:
+        for text in tqdm(dataset,desc= "Encoding dataset into utf-8: "):
             tokens.extend(text.encode("utf-8"))
 
         return tokens
 
-    def fit(self,dataset:list[str],n_merges:int = 1000) -> None:
-        tokens:list[int] = self._encode_raw_dataset(dataset)
+    def fit(self,dataset:list[str] | IterableDataset,n_merges:int = 1000,multiproces:bool = False) -> None:
+        if type(dataset) == list:
+            tokens:list[int] = self._encode_raw_dataset(dataset)
+        elif dataset.num_shards == 1 or not multiproces:
+            tokens:list[int] = self._encode_huggingface_dataset(dataset)
+        else:
+            tokens:list[int] = self._encode_hugginface_dataset_multiprocessing(dataset)
 
         for _ in tqdm(range(n_merges),desc= "fitting tokenizer"):
             counts:dict[tuple[int, int], int] = self._get_stats(tokens)
-            mcp:int = max(counts,keys = counts.get)
+            mcp:int = max(counts,key = counts.get)
             self._last_token+=1
-            self.merge[mcp] = self._last_token
-            self._vocabulary = (self._vocabulary[mcp[0]],self.self._vocabulary[mcp[1]])
+            self._merges[mcp] = self._last_token
+            self._vocabulary[self._last_token] = self._vocabulary[mcp[0]] + self._vocabulary[mcp[1]]
 
             tokens:list[int] = self._merge_pair(tokens,mcp,self._last_token)
 
@@ -82,9 +116,9 @@ class Tokenizer:
     def _padding(self, token_list: list[int]) -> list[int]:
         if self.padding_length < len(token_list):
             return token_list[:self.padding_length]       
-        padding = [0] * (self.padding_length - len(token_list))
+        padding_length = [0] * (self.padding_length - len(token_list))
 
-        return token_list + padding                       
+        return token_list + padding_length                       
 
     def transform(self, dataset: list[str]) -> list[list[int]]:
         return [self._padding(self.encode(text)) for text in dataset]
@@ -121,14 +155,25 @@ class Tokenizer:
             )
             self._last_token = max(self._last_token, new_id)
     
+    def __len__(self):
+        return len(list(self._vocabulary.keys()))
 
+def train_tokenizer(path:str,dataset:IterableDataset | list[str],padding_length = 512, 
+                    not_found_token:int = 0,n_merges:int = 1000):
+    tokenizer:Tokenizer = Tokenizer(padding_length=padding_length,not_found_token=not_found_token)
 
+    if isinstance(dataset,IterableDatasetDict):
+        dataset = dataset["train"]
 
-def merge_vocabularies(base: Tokenizer, vocabularies: list[dict]) -> None:
-    for vocab in tqdm(vocabularies, desc="Merging vocab"):
-        for word, _ in vocab.items():
-            if word not in base._found_word:
-                base._last_token += 1
-                base._vocabulary[word] = base._last_token
-                base._found_word.add(word)
+    tokenizer.fit(dataset,n_merges=n_merges)
+    tokenizer.save_tokenizer(path)
 
+    print(f"Tokenizer trained the len of the vocab is {len(tokenizer)}")
+    
+
+def main():
+    dataset:IterableDataset = load_dataset("wikimedia/wikipedia", "20231101.en",streaming=True)
+    train_tokenizer("wiki_agentic/tokenizer.json",dataset)
+
+if __name__ == "__main__":
+    main()
