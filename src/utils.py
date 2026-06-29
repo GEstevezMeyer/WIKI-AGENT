@@ -1,4 +1,6 @@
+import tomllib
 from datasets import load_dataset, IterableDataset
+
 
 def divide_dataset_shards(huggingface_dataset: str,version_dataset: str,
                           split: str,number_shards: int = 1) -> list[IterableDataset]:
@@ -9,3 +11,10 @@ def divide_dataset_shards(huggingface_dataset: str,version_dataset: str,
         dataset:IterableDataset = load_dataset(huggingface_dataset, streaming=True)[split]
 
     return [dataset.shard(num_shards=number_shards, index=i)for i in range(number_shards)]
+
+
+def load_config(config_path:str = "src/config.toml") -> dict[dict]:
+    
+    with open(config_path,"rb") as f:
+        config = tomllib.load(f)
+    return config

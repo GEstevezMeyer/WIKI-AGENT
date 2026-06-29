@@ -4,16 +4,11 @@ from multiprocessing import Pool
 from datasets import IterableDataset,IterableDatasetDict,load_dataset
 from tqdm import tqdm 
 
-def _encode_huggingface_dataset_standalone(dataset: IterableDataset) -> list[int]:
-    tokens: list[int] = []
-    for row in tqdm(dataset, desc="encoding"):
-        tokens.extend(row["text"].encode("utf-8"))
-    return tokens
-
 
 
 class Tokenizer:
     def __init__(self,padding_length:int = 512,not_found_token:int = 0):
+        self.counts = {}
         self._merges:dict[tuple[int,int],int] = {}
         self._vocabulary:dict[int,bytes] = {}
         self.padding_length: int = padding_length
@@ -23,12 +18,58 @@ class Tokenizer:
         for i in range(256):
             self._vocabulary[i] = bytes([i])
 
-    @staticmethod
-    def _get_stats(tokens: list[int]) -> dict[tuple[int, int], int]:
-        counts: dict[tuple[int, int], int] = {}
-        for pair in zip(tokens, tokens[1:]):
-            counts[pair] = counts.get(pair, 0) + 1
-        return counts
+    def _get_stats_from_word_freqs(self) -> None:
+        self.counts = {}
+        for word_tokens, freq in self.word_freqs.items():
+            for pair in zip(word_tokens, word_tokens[1:]):
+                self.counts[pair] = self.counts.get(pair, 0) + freq
+
+    def _build_word_freqs(self, dataset: IterableDataset) -> None:
+        self.word_freqs = {}
+        for row in tqdm(dataset, desc="building word frequencies"):
+            for word in row["text"].split():
+                token_tuple = tuple(word.encode("utf-8"))
+                self.word_freqs[token_tuple] = self.word_freqs.get(token_tuple, 0) + 1
+
+    def _build_word_freqs_raw(self, dataset: list[str]) -> None:
+        self.word_freqs = {}
+        for text in tqdm(dataset, desc="building word frequencies"):
+            for word in text.split():
+                token_tuple = tuple(word.encode("utf-8"))
+                self.word_freqs[token_tuple] = self.word_freqs.get(token_tuple, 0) + 1
+
+    def _merge_word_freqs(self, pair: tuple[int, int]) -> None:
+        new_word_freqs = {}
+        for word_tokens, freq in self.word_freqs.items():
+            new_tokens = []
+            i = 0
+            while i < len(word_tokens):
+                if i < len(word_tokens) - 1 and word_tokens[i] == pair[0] and word_tokens[i+1] == pair[1]:
+                    new_tokens.append(self._last_token)
+                    i += 2
+                else:
+                    new_tokens.append(word_tokens[i])
+                    i += 1
+            new_word_freqs[tuple(new_tokens)] = freq
+        self.word_freqs = new_word_freqs
+
+    def fit(self, dataset: list[str] | IterableDataset, n_merges: int = 1000) -> None:
+        if isinstance(dataset, list):
+            self._build_word_freqs_raw(dataset)
+        else:
+            self._build_word_freqs(dataset)
+
+        self._get_stats_from_word_freqs()
+
+        for _ in tqdm(range(n_merges), desc="fitting tokenizer"):
+            if not self.counts:
+                break
+            mcp = max(self.counts, key=self.counts.get)
+            self._last_token += 1
+            self._merges[mcp] = self._last_token
+            self._vocabulary[self._last_token] = self._vocabulary[mcp[0]] + self._vocabulary[mcp[1]]
+            self._merge_word_freqs(mcp)
+            self._get_stats_from_word_freqs()
 
     @staticmethod
     def _merge_pair(ids: list[int], pair: tuple[int, int], new_id: int) -> list[int]:
@@ -44,57 +85,6 @@ class Tokenizer:
                 new_ids.append(ids[i])
                 i += 1
         return new_ids
-    
-    
-    def _encode_hugginface_dataset_multiprocessing(self,dataset:IterableDataset):
-        cpu_count:int = int(os.environ.get("cpu_count",1))
-        n_process = cpu_count
-        if cpu_count > dataset.num_shards:
-            n_process = dataset.num_shards
-
-        divided_dataset:list[IterableDataset] = [dataset.shard(num_shards=cpu_count,index=i) for i in range(n_process)]
-        res_tokens:list[int] = []
-
-        with Pool(n_process) as p:
-            divided_tokens:list[list[int]] = p.map(_encode_huggingface_dataset_standalone,divided_dataset)
-
-        for tokens in tqdm(divided_tokens,desc="merging tokens"):
-            res_tokens.extend(tokens)
-
-        return res_tokens
-
-    @staticmethod
-    def _encode_huggingface_dataset(dataset:IterableDataset) -> list[int]:
-        tokens:list[int] = [] 
-        for row in tqdm(dataset,desc="encoding hugging face dataset"):
-            tokens.extend(row["text"].encode("utf-8"))
-        return tokens
-
-    @staticmethod
-    def _encode_raw_dataset(dataset:list[str]) -> list[int]:
-        tokens:list[int] = []
-        for text in tqdm(dataset,desc= "Encoding dataset into utf-8: "):
-            tokens.extend(text.encode("utf-8"))
-
-        return tokens
-
-    def fit(self,dataset:list[str] | IterableDataset,n_merges:int = 1000,multiproces:bool = False) -> None:
-        if type(dataset) == list:
-            tokens:list[int] = self._encode_raw_dataset(dataset)
-        elif dataset.num_shards == 1 or not multiproces:
-            tokens:list[int] = self._encode_huggingface_dataset(dataset)
-        else:
-            tokens:list[int] = self._encode_hugginface_dataset_multiprocessing(dataset)
-
-        for _ in tqdm(range(n_merges),desc= "fitting tokenizer"):
-            counts:dict[tuple[int, int], int] = self._get_stats(tokens)
-            mcp:int = max(counts,key = counts.get)
-            self._last_token+=1
-            self._merges[mcp] = self._last_token
-            self._vocabulary[self._last_token] = self._vocabulary[mcp[0]] + self._vocabulary[mcp[1]]
-
-            tokens:list[int] = self._merge_pair(tokens,mcp,self._last_token)
-
 
     def encode(self, text: str) -> list[int]:
         tokens: list[int] = list(text.encode("utf-8"))
@@ -172,8 +162,7 @@ def train_tokenizer(path:str,dataset:IterableDataset | list[str],padding_length 
     
 
 def main():
-    dataset:IterableDataset = load_dataset("wikimedia/wikipedia", "20231101.en",streaming=True)
-    train_tokenizer("wiki_agentic/tokenizer.json",dataset)
+    dataset:IterableDataset = load_dataset("wikimedia/wikipedia", "20231101.en",streaming=True)["train"]
+    dataset = dataset.take(100_000)
+    train_tokenizer("src/tokenizer.json",dataset)
 
-if __name__ == "__main__":
-    main()

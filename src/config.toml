@@ -1,0 +1,9 @@
+[pipeline]
+batch_size = 64
+shuffle = false
+[model]
+number_layers = 3
+embed_dim = 768
+number_heads = 6
+p_dropout = 0.05
+d_ff = 0
